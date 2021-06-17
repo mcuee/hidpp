@@ -81,7 +81,12 @@ RawDevice::RawDevice (const std::string &path):
 		::close (_p->fd);
 		throw std::system_error (err, std::system_category (), "HIDIOCGRDESC");
 	}
-	_report_desc = ReportDescriptor (rdesc.value, rdesc.value+rdesc.size);
+	try {
+		_report_desc = ReportDescriptor::fromRawData (rdesc.value, rdesc.size);
+	}
+	catch (std::exception &e) {
+		Log::error () << "Invalid report descriptor: " << e.what () << std::endl;
+	}
 
 	if (-1 == ::pipe (_p->pipe)) {
 		int err = errno;

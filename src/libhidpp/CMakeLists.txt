@@ -7,6 +7,7 @@ set(LIBHIDPP_SOURCES
 	hid/RawDevice_${HID_BACKEND}.cpp
 	hid/DeviceMonitor_${HID_BACKEND}.cpp
 	hid/UsageStrings.cpp
+	hid/ReportDescriptor.cpp
 	hidpp/Dispatcher.cpp
 	hidpp/SimpleDispatcher.cpp
 	hidpp/DispatcherThread.cpp
