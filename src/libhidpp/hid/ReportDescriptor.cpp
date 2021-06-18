@@ -163,12 +163,12 @@ ReportDescriptor ReportDescriptor::fromRawData (const uint8_t *data, std::size_t
 				auto [it, inserted] = descriptor.collections.back ().reports.emplace (id, 0);
 				ReportField::Flags flags = {item.get<unsigned int> ()};
 				if (!local.usages.empty ()) {
-					auto & f = it->second.emplace_back ();
+					auto &f = it->second.emplace_back ();
 					f.flags = flags;
 					f.usages = std::move (local.usages);
 				}
 				else if (local.usage_min != 0 || local.usage_max != 0 || !flags.isConstant()) { // exclude padding fields
-					auto & f = it->second.emplace_back ();
+					auto &f = it->second.emplace_back ();
 					f.flags = flags;
 					f.usages = std::make_pair (local.usage_min, local.usage_max);
 				}

@@ -106,73 +106,6 @@ RawDevice::RawDevice ():
 {
 }
 
-static const std::array<uint8_t, 27> ShortReportDesc = {
-	0x06, 0x00, 0xFF,	// Usage Page (FF00 - Vendor)
-	0x09, 0x01,		// Usage (0001 - Vendor)
-	0xA1, 0x01,		// Collection (Application)
-	0x85, 0x10,		//   Report ID (16)
-	0x75, 0x08,		//   Report Size (8)
-	0x95, 0x06,		//   Report Count (6)
-	0x15, 0x00,		//   Logical Minimum (0)
-	0x26, 0xFF, 0x00,	//   Logical Maximum (255)
-	0x09, 0x01,		//   Usage (0001 - Vendor)
-	0x81, 0x00,		//   Input (Data, Array, Absolute)
-	0x09, 0x01,		//   Usage (0001 - Vendor)
-	0x91, 0x00,		//   Output (Data, Array, Absolute)
-	0xC0			// End Collection
-};
-
-static const std::array<uint8_t, 27> LongReportDesc = {
-	0x06, 0x00, 0xFF,	// Usage Page (FF00 - Vendor)
-	0x09, 0x02,		// Usage (0002 - Vendor)
-	0xA1, 0x01,		// Collection (Application)
-	0x85, 0x11,		//   Report ID (17)
-	0x75, 0x08,		//   Report Size (8)
-	0x95, 0x13,		//   Report Count (19)
-	0x15, 0x00,		//   Logical Minimum (0)
-	0x26, 0xFF, 0x00,	//   Logical Maximum (255)
-	0x09, 0x02,		//   Usage (0002 - Vendor)
-	0x81, 0x00,		//   Input (Data, Array, Absolute)
-	0x09, 0x02,		//   Usage (0002 - Vendor)
-	0x91, 0x00,		//   Output (Data, Array, Absolute)
-	0xC0			// End Collection
-};
-
-template<typename Caps, NTSTATUS (*GetCaps) (HIDP_REPORT_TYPE, Caps *, PUSHORT, PHIDP_PREPARSED_DATA)>
-static std::set<uint8_t> readCaps (USHORT count, HIDP_REPORT_TYPE report_type, PHIDP_PREPARSED_DATA preparsed_data, ReportDescriptor &rdesc)
-{
-	if (count == 0)
-		return {};
-	auto windebug = Log::debug ("windows");
-	std::vector<Caps> caps (count);
-	USHORT len = count;
-	if (HIDP_STATUS_SUCCESS != GetCaps (report_type, caps.data (), &len, preparsed_data)) {
-		throw std::runtime_error ("HidP_GetButtonCaps failed for input reports");
-	}
-
-	std::set<uint8_t> report_ids;
-	for (const auto &cap: caps) {
-		report_ids.insert (cap.ReportID);
-
-		// Hack around the lack of raw report descriptor
-		if (cap.ReportID == 0x10
-		    && cap.UsagePage == 0xff00
-		    && !cap.IsRange && cap.NotRange.Usage == 0x0001) {
-			rdesc.insert (rdesc.end (),
-				      ShortReportDesc.begin (),
-				      ShortReportDesc.end ());
-		}
-		if (cap.ReportID == 0x11
-		    && cap.UsagePage == 0xff00
-		    && !cap.IsRange && cap.NotRange.Usage == 0x0002) {
-			rdesc.insert (rdesc.end (),
-				      LongReportDesc.begin (),
-				      LongReportDesc.end ());
-		}
-	}
-	return report_ids;
-}
-
 RawDevice::RawDevice (const std::string &path):
 	_p (std::make_unique<PrivateImpl> ())
 {
@@ -252,43 +185,63 @@ RawDevice::RawDevice (const std::string &path):
 						 "HidD_GetPreparsedData");
 		}
 
+		std::unique_ptr<_HIDP_PREPARSED_DATA, decltype(&HidD_FreePreparsedData)> unique_preparsed_data (preparsed_data, &HidD_FreePreparsedData);
+
 		HIDP_CAPS &caps = _p->devices.back ().caps;
-		if (HIDP_STATUS_SUCCESS != HidP_GetCaps (preparsed_data, &caps)) {
-			HidD_FreePreparsedData (preparsed_data);
+		if (HIDP_STATUS_SUCCESS != HidP_GetCaps (preparsed_data, &caps))
 			throw std::runtime_error ("HidP_GetCaps failed");
-		}
 
-		try {
-			auto ib = readCaps<HIDP_BUTTON_CAPS, HidP_GetButtonCaps> (
-					caps.NumberInputButtonCaps,
-					HidP_Input, preparsed_data,
-					_report_desc);
-			auto iv = readCaps<HIDP_VALUE_CAPS, HidP_GetValueCaps> (
-					caps.NumberInputValueCaps,
-					HidP_Input, preparsed_data,
-					_report_desc);
-			auto ob = readCaps<HIDP_BUTTON_CAPS, HidP_GetButtonCaps> (
-					caps.NumberOutputButtonCaps,
-					HidP_Output, preparsed_data,
-					_report_desc);
-			auto ov = readCaps<HIDP_VALUE_CAPS, HidP_GetValueCaps> (
-					caps.NumberOutputValueCaps,
-					HidP_Output, preparsed_data,
-					_report_desc);
-			for (const auto &ids: { ib, iv, ob, ov }) {
-				for (uint8_t id: ids) {
-					auto ret = _p->reports.emplace (id, hdev);
-					if (!ret.second && ret.first->second != hdev)
-						throw std::runtime_error ("Same Report ID on different handle.");
+		auto &collection = _report_desc.collections.emplace_back();
+		collection.usage = (uint32_t (caps.UsagePage) << 16) | caps.Usage;
+
+		for (auto [windows_report_type, report_type, button_count, value_count]: {
+				std::make_tuple(HidP_Input, ReportID::Type::Input, caps.NumberInputButtonCaps, caps.NumberInputValueCaps),
+				std::make_tuple(HidP_Output, ReportID::Type::Output, caps.NumberOutputButtonCaps, caps.NumberOutputValueCaps),
+				std::make_tuple(HidP_Feature, ReportID::Type::Feature, caps.NumberFeatureButtonCaps, caps.NumberFeatureValueCaps)}) {
+			std::vector<HIDP_BUTTON_CAPS> button_caps (button_count);
+			std::vector<HIDP_VALUE_CAPS> value_caps (value_count);
+
+			USHORT len = button_caps.size ();
+			if (len > 0 && HIDP_STATUS_SUCCESS != HidP_GetButtonCaps (windows_report_type, button_caps.data (), &len, preparsed_data))
+				throw std::runtime_error ("HidP_GetButtonCaps failed");
+			len = value_caps.size ();
+			if (len > 0 && HIDP_STATUS_SUCCESS != HidP_GetValueCaps (windows_report_type, value_caps.data (), &len, preparsed_data))
+				throw std::runtime_error ("HidP_GetValueCaps failed");
+
+			auto add_field = [&] (auto cap) {
+				auto [it, inserted] = collection.reports.emplace (ReportID{report_type, cap.ReportID}, 0);
+				auto &f = it->second.emplace_back ();
+				f.flags.bits = cap.BitField;
+				if (cap.IsRange) {
+					f.usages = std::make_pair (
+							(uint32_t (cap.UsagePage) << 16) | cap.Range.UsageMin,
+							(uint32_t (cap.UsagePage) << 16) | cap.Range.UsageMax);
 				}
+				else {
+					f.usages = std::vector {(uint32_t (cap.UsagePage) << 16) | cap.NotRange.Usage};
+				}
+			};
+
+			// Add fields ordered by DataIndex
+			auto button_it = button_caps.begin ();
+			auto value_it = value_caps.begin ();
+			while (button_it != button_caps.end () && value_it != value_caps.end ()) {
+				if (button_it->NotRange.DataIndex < value_it->NotRange.DataIndex)
+					add_field (*(button_it++));
+				else
+					add_field (*(value_it++));
 			}
-		}
-		catch (std::exception &) {
-			HidD_FreePreparsedData (preparsed_data);
-			throw;
+			while (button_it != button_caps.end ())
+				add_field (*(button_it++));
+			while (value_it != value_caps.end ())
+				add_field (*(value_it++));
 		}
 
-		HidD_FreePreparsedData (preparsed_data);
+		for (const auto &[id, fields]: collection.reports) {
+			auto [it, inserted] = _p->reports.emplace (id.id, hdev);
+			if (!inserted && it->second != hdev)
+				throw std::runtime_error ("Same Report ID on different handle.");
+		}
 	}
 
 	_p->interrupted_event = CreateEvent (NULL, FALSE, FALSE, NULL);
